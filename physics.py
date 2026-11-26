@@ -156,6 +156,44 @@ def manual_launch(v0: float, angle: float, h0: float) -> Launch:
     return Launch(v0, angle, h0)
 
 
+@dataclass
+class Prototype:
+    """Исходные данные для ложки команды с осью внутри стержня."""
+    k: float
+    l0: float
+    l_cocked: float
+    l_release: float
+    m: float
+    m_arm: float
+    radius: float
+    spoon_length: float
+    axis_offset: float
+    angle_cocked: float
+    angle_release: float
+
+
+def prototype_speed(p: Prototype, g: float = G) -> float:
+    """Скорость вылета по балансу энергии из раздела 4 записки."""
+    _require(p.k > 0 and p.l0 > 0, "Жёсткость и свободная длина резинки должны быть положительными.")
+    _require(p.l0 <= p.l_release < p.l_cocked,
+             "Длины резинки должны удовлетворять l₀ ≤ l₁ < l при взводе.")
+    _require(p.m > 0 and p.m_arm > 0, "Массы снаряда и ложки должны быть положительными.")
+    _require(0 < p.radius <= p.spoon_length, "Расстояние до снаряда должно быть больше нуля и не длиннее ложки.")
+    _require(0 <= p.axis_offset <= p.spoon_length / 2, "Смещение оси должно быть в пределах половины длины ложки.")
+    _require(-90 <= p.angle_cocked < p.angle_release <= 90,
+             "Углы ложки должны удовлетворять −90° ≤ α₀ < α₁ ≤ 90°.")
+    _require(g > 0, "Ускорение свободного падения g должно быть положительным.")
+
+    dx_cocked = p.l_cocked - p.l0
+    dx_release = p.l_release - p.l0
+    energy = p.k * (dx_cocked**2 - dx_release**2) / 2
+    delta_sine = math.sin(math.radians(p.angle_release)) - math.sin(math.radians(p.angle_cocked))
+    lift = g * (p.m * p.radius + p.m_arm * p.axis_offset) * delta_sine
+    inertia = p.m_arm * (p.spoon_length**2 / 12 + p.axis_offset**2)
+    _require(energy > lift, "Энергии резинки не хватает на подъём снаряда и ложки.")
+    return math.sqrt(2 * (energy - lift) / (p.m + inertia / p.radius**2))
+
+
 # ---------------------------------------------------------------------------
 # Раздел 5. Кинематический анализ: траектория полёта
 # ---------------------------------------------------------------------------
@@ -202,61 +240,3 @@ def parabola(start: Launch, g: float = G) -> tuple[float, float, float]:
     """Коэффициенты уравнения траектории y(x) = a + b·x − c·x²."""
     th = math.radians(start.angle)
     return start.h0, math.tan(th), g / (2 * start.v0 ** 2 * math.cos(th) ** 2)
-
-
-def flight_with_drag(start: Launch, m: float, diameter: float, cd: float = 0.47,
-                     rho: float = 1.2, g: float = G, dt: float = 1e-3) -> Trajectory:
-    """Полёт с квадратичным сопротивлением воздуха F = ½·ρ·Cx·S·v², S = π·d²/4.
-
-    Уравнения движения dvx/dt = −β·v·vx,  dvy/dt = −g − β·v·vy,  β = ρ·Cx·S/(2m)
-    интегрируются численно методом Рунге — Кутты 4-го порядка с шагом dt.
-    """
-    _require(g > 0, "Ускорение свободного падения g должно быть положительным.")
-    _require(m > 0, "Масса снаряда m должна быть положительной.")
-    _require(diameter > 0, "Диаметр снаряда d должен быть положительным.")
-    _require(cd >= 0, "Коэффициент сопротивления Cx не может быть отрицательным.")
-    _require(rho >= 0, "Плотность воздуха ρ не может быть отрицательной.")
-    beta = rho * cd * math.pi * diameter ** 2 / 4 / (2 * m)
-
-    def deriv(s: tuple[float, ...]) -> tuple[float, ...]:
-        _, _, vx, vy = s
-        v = math.hypot(vx, vy)
-        return vx, vy, -beta * v * vx, -g - beta * v * vy
-
-    def shift(s: tuple[float, ...], d: tuple[float, ...], h: float) -> tuple[float, ...]:
-        return tuple(si + h * di for si, di in zip(s, d))
-
-    th = math.radians(start.angle)
-    s = (0.0, start.h0, start.v0 * math.cos(th), start.v0 * math.sin(th))  # x, y, vx, vy
-    t = 0.0
-    ts, xs, ys = [t], [s[0]], [s[1]]
-    max_height, x_at_max = s[1], s[0]
-    while True:
-        k1 = deriv(s)
-        k2 = deriv(shift(s, k1, dt / 2))
-        k3 = deriv(shift(s, k2, dt / 2))
-        k4 = deriv(shift(s, k3, dt))
-        new = tuple(si + dt / 6 * (a + 2 * b + 2 * c + d)
-                    for si, a, b, c, d in zip(s, k1, k2, k3, k4))
-        if new[1] <= 0:
-            # Точку касания поверхности находим линейной интерполяцией внутри шага
-            frac = s[1] / (s[1] - new[1])
-            s = tuple(si + frac * (ni - si) for si, ni in zip(s, new))
-            t += frac * dt
-            ts.append(t)
-            xs.append(s[0])
-            ys.append(0.0)
-            break
-        s, t = new, t + dt
-        ts.append(t)
-        xs.append(s[0])
-        ys.append(s[1])
-        if s[1] > max_height:
-            max_height, x_at_max = s[1], s[0]
-        _require(t < 600, "Снаряд не приземлился за 10 минут полёта — проверьте исходные данные.")
-    return Trajectory(
-        t=np.array(ts), x=np.array(xs), y=np.array(ys), flight_time=t, distance=s[0],
-        max_height=max_height, x_at_max=x_at_max,
-        impact_speed=math.hypot(s[2], s[3]),
-        impact_angle=math.degrees(math.atan2(-s[3], s[2])),
-    )

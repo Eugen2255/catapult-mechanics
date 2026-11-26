@@ -11,17 +11,18 @@ import math
 import time
 import tkinter as tk
 from dataclasses import dataclass
-from tkinter import messagebox, ttk
+from tkinter import font as tkfont, messagebox, ttk
 
 import numpy as np
+from matplotlib import rcParams
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
 from matplotlib.figure import Figure
+from matplotlib.ticker import FuncFormatter
 
 import physics as ph
 
 # Поля ввода: (ключ, подпись, значение по умолчанию)
-PROJECTILE = [("m", "Масса снаряда m, кг", 0.010),
-              ("d", "Диаметр снаряда d, м", 0.04)]
+PROJECTILE = [("m", "Масса снаряда m, кг", 0.008)]
 SPRING = [("k", "Жёсткость пружины k, Н/м", 60.0),
           ("dx0", "Растяжение при взводе Δx₀, м", 0.08),
           ("dx1", "Растяжение при отрыве Δx₁, м", 0.02)]
@@ -30,17 +31,36 @@ ARM = [("m_arm", "Масса ложки M, кг", 0.020),
        ("H", "Высота оси над столом H, м", 0.10),
        ("a0", "Угол ложки при взводе α₀, °", 10.0),
        ("a1", "Угол ложки у упора α₁, °", 45.0)]
-MANUAL = [("v0", "Скорость отрыва V₀, м/с", 4.0),
-          ("theta", "Угол вылета θ, °", 45.0),
-          ("h0", "Высота точки отрыва h₀, м", 0.30)]
+MANUAL = [("v0", "Скорость вылета V₀, м/с", 5.54),
+          ("theta", "Угол вылета θ, °", 10.0),
+          ("h0", "Высота вылета h₀, м", 0.127)]
 GRAVITY = [("g", "Ускорение свободного падения g, м/с²", 9.8)]
-AIR = [("cd", "Коэффициент сопротивления Cx", 0.47),
-       ("rho", "Плотность воздуха ρ, кг/м³", 1.2)]
-TASK = [("x1", "Минимальная дальность x₁, м", 2.0),
-        ("x2", "Максимальная дальность x₂, м", 3.0)]
+PROTOTYPE_SPRING = [("k", "Рабочая жёсткость k, Н/м", 342),
+                    ("l0", "Длина резинки без груза l₀, м", 0.029)]
+PROTOTYPE_ARM = [("l_cocked", "Длина резинки при взводе, м", 0.065),
+                 ("l_release", "Длина резинки при отделении, м", 0.040),
+                 ("m", "Масса снаряда m, кг", 0.008),
+                 ("m_arm", "Масса ложки M, кг", 0.011),
+                 ("radius", "От оси до снаряда L, м", 0.0605),
+                 ("spoon_length", "Полная длина ложки l, м", 0.133),
+                 ("axis_offset", "От оси до середины ложки a, м", 0.0115),
+                 ("angle_cocked", "Угол ложки при взводе α₀, °", 0),
+                 ("angle_release", "Угол ложки у упора α₁, °", 45)]
+PROTOTYPE_LOADS = (("1,175", "0,062"), ("1,539", "0,074"))
+TASK = [("x1", "Минимальная дальность x₁, м", 1.2),
+        ("x2", "Максимальная дальность x₂, м", 1.5)]
+EXPERIMENTAL_RANGE = 1.40
 
 SPEEDS = {"×1": 1.0, "×0.5": 0.5, "×0.25": 0.25, "×0.1": 0.1}
-BLUE, RED, GREEN, WOOD, DARK_WOOD = "#1f77b4", "#d62728", "#2ca02c", "#a0703c", "#5c3a1a"
+FONT = "Times New Roman"
+INK, MUTED = "#322927", "#63514a"
+PAPER, PANEL, GRID = "#fffcf7", "#f5eee5", "#ded1c4"
+TERRACOTTA, OLIVE = "#a04435", "#67754d"
+PETG, HARDWARE = "#4c4340", "#2d2928"
+
+
+def decimal(value: float, places: int) -> str:
+    return f"{value:.{places}f}".replace(".", ",")
 
 
 def parse_number(text: str, name: str) -> float:
@@ -56,9 +76,9 @@ def parse_number(text: str, name: str) -> float:
 
 def verdict(x: float, x1: float, x2: float) -> str:
     if x < x1:
-        return f"недолёт {x1 - x:.2f} м"
+        return f"недолёт {decimal(x1 - x, 2)} м"
     if x > x2:
-        return f"перелёт {x - x2:.2f} м"
+        return f"перелёт {decimal(x - x2, 2)} м"
     return "попадание в зону"
 
 
@@ -67,14 +87,9 @@ class Shot:
     """Результат одного расчёта."""
     catapult: ph.Catapult | None  # None — параметры отрыва заданы вручную
     launch: ph.Launch
-    ideal: ph.Trajectory          # без сопротивления воздуха
-    drag: ph.Trajectory | None    # с сопротивлением воздуха
+    trajectory: ph.Trajectory
     x1: float
     x2: float
-
-    @property
-    def trajectories(self) -> list[ph.Trajectory]:
-        return [self.ideal] + ([self.drag] if self.drag else [])
 
 
 class App(tk.Tk):
@@ -82,11 +97,14 @@ class App(tk.Tk):
         super().__init__()
         self.title("Катапульта — расчёт траектории снаряда")
         self.minsize(1000, 650)
+        self._set_style()
         self.vars: dict[str, tk.StringVar] = {}
         self.labels: dict[str, str] = {}
-        self.entries: dict[str, ttk.Entry] = {}
-        self.mode = tk.StringVar(value="lever")
-        self.use_drag = tk.BooleanVar(value=True)
+        self.prototype_values = {
+            name: f"{value:g}".replace(".", ",") for name, _, value in PROTOTYPE_SPRING + PROTOTYPE_ARM
+        }
+        self.prototype_loads = PROTOTYPE_LOADS
+        self.mode = tk.StringVar(value="manual")
         self.speed = tk.StringVar(value="×0.5")
         self.shot: Shot | None = None
         self._view: tuple[float, float, float, float] | None = None
@@ -102,18 +120,37 @@ class App(tk.Tk):
 
     # ----------------------------------------------------------- интерфейс
 
+    def _set_style(self) -> None:
+        self.configure(background=PANEL)
+        for name in tkfont.names(self):
+            tkfont.nametofont(name, root=self).configure(family=FONT)
+        theme = ttk.Style(self)
+        theme.theme_use("clam")
+        theme.configure(".", background=PANEL, foreground=INK, bordercolor=GRID,
+                        lightcolor=GRID, darkcolor=GRID, selectbackground=TERRACOTTA,
+                        selectforeground=PAPER, fieldbackground=PAPER, font=(FONT, 11))
+        theme.configure("TLabelframe.Label", foreground=TERRACOTTA, font=(FONT, 12, "bold"))
+        theme.configure("TButton", background="#eaded0", padding=(7, 4))
+        theme.configure("Run.TButton", background=TERRACOTTA, foreground=PAPER)
+        theme.map("TButton", background=[("active", "#dfcec0")])
+        theme.map("Run.TButton", background=[("active", "#853a2d")])
+        rcParams.update({"font.family": "serif", "font.serif": [FONT, "Liberation Serif", "DejaVu Serif"],
+                         "text.color": INK, "axes.labelcolor": INK,
+                         "axes.edgecolor": GRID, "xtick.color": MUTED, "ytick.color": MUTED})
+
     def _build_inputs(self) -> None:
         self._panel = ttk.Frame(self, padding=8)
         self._panel.grid(row=0, column=0, sticky="ns")
         self._row = 0
 
-        box = self._box("Скорость снаряда при отрыве")
-        for row, (text, value) in enumerate([("рассчитать по параметрам катапульты", "lever"),
-                                             ("задать вручную", "manual")]):
+        box = self._box("Режим расчёта")
+        for row, (text, value) in enumerate([("Наша модель · параметры вылета", "manual"),
+                                             ("Расчёт для стержня с осью на конце", "lever")]):
             ttk.Radiobutton(box, text=text, variable=self.mode, value=value,
                             command=self._on_option).grid(row=row, column=0, columnspan=2, sticky="w")
 
-        self._fields(self._box("Снаряд"), PROJECTILE)
+        self.projectile_box = self._box("Снаряд")
+        self._fields(self.projectile_box, PROJECTILE)
 
         self.spring_box = self._box("Пружина (раздел 3)")
         row = self._fields(self.spring_box, SPRING)
@@ -129,22 +166,23 @@ class App(tk.Tk):
                   ).grid(row=row, column=0, columnspan=2, sticky="w", pady=(2, 0))
 
         self.manual_box = self._box("Параметры отрыва")
-        self._fields(self.manual_box, MANUAL)
+        row = self._fields(self.manual_box, MANUAL)
+        ttk.Label(self.manual_box, text="Шарик в опытах · пластилин · 8 г · Ø 20 мм",
+                  foreground=MUTED).grid(row=row, column=0, columnspan=2, sticky="w", pady=(4, 0))
+        ttk.Button(self.manual_box, text="Параметры разделов 3–5…", command=lambda: PrototypeDialog(self)).grid(
+            row=row + 1, column=0, columnspan=2, sticky="ew", pady=(6, 0))
 
         box = self._box("Полёт (раздел 5)")
         self._fields(box, GRAVITY)
-        ttk.Checkbutton(box, text="учитывать сопротивление воздуха", variable=self.use_drag,
-                        command=self._on_option).grid(row=1, column=0, columnspan=2, sticky="w")
-        self._fields(box, AIR, row=2)
 
-        self._fields(self._box("Задание преподавателя"), TASK)
+        self._fields(self._box("Целевой диапазон"), TASK)
 
         buttons = ttk.Frame(self._panel)
         buttons.grid(row=self._row, column=0, sticky="ew", pady=(8, 0))
         buttons.columnconfigure((0, 1), weight=1)
         ttk.Button(buttons, text="Рассчитать", command=self.calculate).grid(
             row=0, column=0, sticky="ew", padx=(0, 2))
-        ttk.Button(buttons, text="▶ Пуск", command=self.animate).grid(
+        ttk.Button(buttons, text="Пуск", style="Run.TButton", command=self.animate).grid(
             row=0, column=1, sticky="ew", padx=(2, 0))
         ttk.Label(buttons, text="Скорость анимации").grid(row=1, column=0, sticky="w", pady=(6, 0))
         ttk.Combobox(buttons, textvariable=self.speed, values=list(SPEEDS), state="readonly",
@@ -160,13 +198,12 @@ class App(tk.Tk):
     def _fields(self, box: ttk.LabelFrame, fields: list, row: int = 0) -> int:
         """Добавляет в группу строки «подпись — поле ввода», возвращает следующую строку."""
         for key, label, default in fields:
-            self.vars[key] = tk.StringVar(value=f"{default:g}")
+            self.vars[key] = tk.StringVar(value=f"{default:g}".replace(".", ","))
             self.labels[key] = label
             ttk.Label(box, text=label).grid(row=row, column=0, sticky="w")
             entry = ttk.Entry(box, textvariable=self.vars[key], width=9, justify="right")
             entry.grid(row=row, column=1, sticky="e", padx=(8, 0), pady=1)
             entry.bind("<Return>", lambda _event: self.calculate())
-            self.entries[key] = entry
             row += 1
         return row
 
@@ -176,7 +213,7 @@ class App(tk.Tk):
         out.columnconfigure(0, weight=1)
         out.rowconfigure(0, weight=1)
 
-        self.fig = Figure(figsize=(9, 5), layout="constrained")
+        self.fig = Figure(figsize=(9, 5), layout="constrained", facecolor=PANEL)
         self.ax = self.fig.add_subplot()
         self.canvas = FigureCanvasTkAgg(self.fig, master=out)
         self.canvas.get_tk_widget().grid(row=0, column=0, columnspan=2, sticky="nsew")
@@ -184,8 +221,9 @@ class App(tk.Tk):
         toolbar = NavigationToolbar2Tk(self.canvas, out, pack_toolbar=False)
         toolbar.grid(row=1, column=0, columnspan=2, sticky="ew")
 
-        self.report = tk.Text(out, height=17, wrap="none", font=("Consolas", 10),
-                              relief="flat", padx=6, pady=4, state="disabled")
+        self.report = tk.Text(out, height=11, wrap="word", font=(FONT, 11),
+                              background=PAPER, foreground=INK, selectbackground=TERRACOTTA,
+                              relief="flat", padx=12, pady=8, state="disabled")
         scroll = ttk.Scrollbar(out, orient="vertical", command=self.report.yview)
         self.report.configure(yscrollcommand=scroll.set)
         self.report.grid(row=2, column=0, sticky="nsew", pady=(6, 0))
@@ -198,18 +236,21 @@ class App(tk.Tk):
     def _update_controls(self) -> None:
         """Показывает поля, нужные в выбранном режиме расчёта."""
         lever = self.mode.get() == "lever"
-        for box, visible in ((self.spring_box, lever), (self.arm_box, lever),
+        for box, visible in ((self.projectile_box, lever), (self.spring_box, lever), (self.arm_box, lever),
                              (self.manual_box, not lever)):
             if visible:
                 box.grid()
             else:
                 box.grid_remove()
-        state = ["!disabled"] if self.use_drag.get() else ["disabled"]
-        for key, *_ in AIR:
-            self.entries[key].state(state)
 
     def _value(self, key: str) -> float:
         return parse_number(self.vars[key].get(), self.labels[key])
+
+    def _target_range(self) -> tuple[float, float]:
+        x1, x2 = self._value("x1"), self._value("x2")
+        if not 0 <= x1 <= x2:
+            raise ValueError("Дальности по заданию должны удовлетворять 0 ≤ x₁ ≤ x₂.")
+        return x1, x2
 
     def _on_close(self) -> None:
         self._stop_animation()
@@ -232,16 +273,12 @@ class App(tk.Tk):
             else:
                 catapult = None
                 launch = ph.manual_launch(v("v0"), v("theta"), v("h0"))
-            ideal = ph.flight(launch, g)
-            drag = (ph.flight_with_drag(launch, v("m"), v("d"), v("cd"), v("rho"), g)
-                    if self.use_drag.get() else None)
-            x1, x2 = v("x1"), v("x2")
-            if not 0 <= x1 <= x2:
-                raise ValueError("Дальности по заданию должны удовлетворять 0 ≤ x₁ ≤ x₂.")
+            trajectory = ph.flight(launch, g)
+            x1, x2 = self._target_range()
         except ValueError as err:
             messagebox.showerror("Ошибка в исходных данных", str(err), parent=self)
             return False
-        self.shot = Shot(catapult, launch, ideal, drag, x1, x2)
+        self.shot = Shot(catapult, launch, trajectory, x1, x2)
         self._draw()
         self._write_report()
         return True
@@ -250,46 +287,48 @@ class App(tk.Tk):
 
     def _draw(self) -> None:
         s, ax, start = self.shot, self.ax, self.shot.launch
+        tr = s.trajectory
         ax.clear()
+        ax.set_facecolor(PAPER)
         ax.set_title("Траектория полёта снаряда")
         ax.set_xlabel("x, м")
         ax.set_ylabel("y, м")
-        ax.grid(True, alpha=0.3)
+        for axis in (ax.xaxis, ax.yaxis):
+            axis.set_major_formatter(FuncFormatter(lambda value, _: f"{value:g}".replace(".", ",")))
+        ax.grid(True, color=GRID, alpha=0.55)
         ax.set_aspect("equal")
 
         # Поверхность, на которой стоит катапульта, и зона попадания по заданию
         ax.axhspan(-1e3, 0, color="#efe9dd", zorder=0)
         ax.axhline(0, color="#8c7b62", lw=1)
-        ax.axvspan(s.x1, s.x2, color=GREEN, alpha=0.12, lw=0,
-                   label=f"зона попадания {s.x1:g}–{s.x2:g} м")
+        ax.axvspan(s.x1, s.x2, color=OLIVE, alpha=0.14, lw=0,
+                   label=f"Цель  {decimal(s.x1, 2)}–{decimal(s.x2, 2)} м")
+        self.path = ax.plot(tr.x, tr.y, color=TERRACOTTA, lw=2.4,
+                            label=f"Расчёт  {decimal(tr.distance, 2)} м")[0]
+        self.trail = ax.plot([], [], color=TERRACOTTA, lw=2.4)[0]
+        self.ball = ax.plot([0], [start.h0], "o", color=TERRACOTTA, ms=7,
+                           mec=PAPER, zorder=6)[0]
+        if s.catapult is None:
+            ax.plot([EXPERIMENTAL_RANGE], [0], "D", color=OLIVE, ms=6, zorder=6,
+                    label=f"Среднее по опытам  ≈ {decimal(EXPERIMENTAL_RANGE, 2)} м")
 
-        styles = [(BLUE, "-", "без сопротивления воздуха"), (RED, "--", "с сопротивлением воздуха")]
-        self.paths, self.trails, self.balls = [], [], []
-        for traj, (color, ls, name) in zip(s.trajectories, styles):
-            self.paths.append(ax.plot(traj.x, traj.y, color=color, ls=ls, lw=2,
-                                      label=f"{name}: x = {traj.distance:.2f} м")[0])
-            self.trails.append(ax.plot([], [], color=color, ls=ls, lw=2.2)[0])
-            self.balls.append(ax.plot([0], [start.h0], "o", color=color, ms=9, mec="k", zorder=6)[0])
-
-        top = s.ideal
-        if top.max_height > start.h0 + 1e-6:
-            ax.plot([top.x_at_max], [top.max_height], ".", color=BLUE)
-            ax.annotate(f"y_max = {top.max_height:.2f} м", (top.x_at_max, top.max_height),
+        if tr.max_height > start.h0 + 1e-6:
+            ax.plot([tr.x_at_max], [tr.max_height], ".", color=TERRACOTTA)
+            ax.annotate(f"Высота ≈ {decimal(tr.max_height, 3)} м", (tr.x_at_max, tr.max_height),
                         xytext=(0, 6), textcoords="offset points", ha="center", fontsize=9,
-                        color=BLUE)
+                        color=TERRACOTTA)
 
         # Высота точки отрыва и вектор начальной скорости
-        xs = [0.0, s.x2] + [t.distance for t in s.trajectories]
-        ys = [start.h0] + [t.max_height for t in s.trajectories]
+        xs = [0.0, s.x2, tr.distance]
+        ys = [start.h0, tr.max_height]
+        if s.catapult is None:
+            xs.append(EXPERIMENTAL_RANGE)
         ax.plot([0, 0], [0, start.h0], ":", color="gray")
         arrow = 0.12 * (max(xs) - min(xs))
         th = math.radians(start.angle)
         tip = (arrow * math.cos(th), start.h0 + arrow * math.sin(th))
         ax.annotate("", xy=tip, xytext=(0, start.h0), zorder=7,
-                    arrowprops=dict(arrowstyle="-|>", color="k", lw=1.5))
-        ax.annotate(f"V₀ = {start.v0:.2f} м/с\nθ = {start.angle:.1f}°\nh₀ = {start.h0:.2f} м",
-                    xy=tip, xytext=(-6, 6), textcoords="offset points", ha="right",
-                    va="bottom", fontsize=9)
+                    arrowprops=dict(arrowstyle="-|>", color=INK, lw=1.25))
 
         self.arm = None
         if s.catapult:
@@ -297,18 +336,18 @@ class App(tk.Tk):
             px, py = c.pivot
             cocked = c.tip(c.angle_cocked)
             base = (min(cocked[0], px - 0.5 * c.arm_length), px + 0.3 * c.arm_length)
-            ax.plot(base, [0, 0], color=WOOD, lw=6, solid_capstyle="butt", zorder=3)  # основание
-            ax.plot([px, px], [0, py], color=WOOD, lw=4, zorder=3)                    # стойка
-            ax.plot([px, cocked[0]], [py, cocked[1]], color=DARK_WOOD, lw=3, ls="--",
+            ax.plot(base, [0, 0], color=PETG, lw=6, solid_capstyle="butt", zorder=3)
+            ax.plot([px, px], [0, py], color=PETG, lw=4, zorder=3)
+            ax.plot([px, cocked[0]], [py, cocked[1]], color=HARDWARE, lw=3, ls="--",
                     alpha=0.35, zorder=3)                                             # ложка при взводе
-            self.arm = ax.plot([px, 0], [py, start.h0], color=DARK_WOOD, lw=4,
+            self.arm = ax.plot([px, 0], [py, start.h0], color=HARDWARE, lw=4,
                                solid_capstyle="round", zorder=4)[0]                   # ложка у упора
             ax.plot([px], [py], "o", ms=7, mfc="white", mec="k", zorder=5)            # ось
             xs += base
             ys.append(py + c.arm_length)
-
-        self.clock = ax.text(0.01, 0.98, "", transform=ax.transAxes, va="top", fontsize=10)
-        ax.legend(loc="upper right", fontsize=9, framealpha=0.9)
+        self.clock = ax.text(.98, .69, "", transform=ax.transAxes, ha="right", va="top", fontsize=10)
+        ax.legend(loc="upper right", fontsize=10, facecolor=PAPER, edgecolor=GRID,
+                  framealpha=1, borderpad=.7)
 
         pad = 0.05 * (max(xs) - min(xs))
         self._view = (min(xs) - pad, max(xs) + pad, -pad, 1.25 * max(ys) + pad)
@@ -353,13 +392,12 @@ class App(tk.Tk):
             c = s.catapult
             self._swing = (2 * math.radians(c.angle_release - c.angle_cocked)
                            * c.arm_length / s.launch.v0)
-        self._duration = self._swing + max(t.flight_time for t in s.trajectories)
+        self._duration = self._swing + s.trajectory.flight_time
         self._rate = SPEEDS[self.speed.get()]
-        for path in self.paths:
-            path.set_alpha(0.25)
+        self.path.set_alpha(0.25)
         # Неподвижная часть рисунка сохраняется один раз, в каждом кадре
         # поверх неё перерисовываются только движущиеся объекты
-        self._moving = [*self.trails, *self.balls, self.clock] + ([self.arm] if self.arm else [])
+        self._moving = [self.trail, self.ball, self.clock] + ([self.arm] if self.arm else [])
         for artist in self._moving:
             artist.set_animated(True)
         self.canvas.draw()
@@ -375,21 +413,20 @@ class App(tk.Tk):
             angle = c.angle_cocked + (c.angle_release - c.angle_cocked) * (t / self._swing) ** 2
             x, y = c.tip(angle)
             self.arm.set_data([c.pivot[0], x], [c.pivot[1], y])
-            for ball in self.balls:
-                ball.set_data([x], [y])
+            self.ball.set_data([x], [y])
             self.clock.set_text("разгон снаряда…")
         else:
             if self.arm:
                 c = s.catapult
                 self.arm.set_data([c.pivot[0], 0], [c.pivot[1], s.launch.h0])
             tf = t - self._swing
-            for traj, trail, ball in zip(s.trajectories, self.trails, self.balls):
-                tt = min(tf, traj.flight_time)
-                x, y = np.interp(tt, traj.t, traj.x), np.interp(tt, traj.t, traj.y)
-                n = np.searchsorted(traj.t, tt)
-                trail.set_data(np.append(traj.x[:n], x), np.append(traj.y[:n], y))
-                ball.set_data([x], [y])
-            self.clock.set_text(f"t = {tf:.2f} с")
+            traj = s.trajectory
+            tt = min(tf, traj.flight_time)
+            x, y = np.interp(tt, traj.t, traj.x), np.interp(tt, traj.t, traj.y)
+            n = np.searchsorted(traj.t, tt)
+            self.trail.set_data(np.append(traj.x[:n], x), np.append(traj.y[:n], y))
+            self.ball.set_data([x], [y])
+            self.clock.set_text(f"t = {decimal(tf, 2)} с")
         self.canvas.restore_region(self._background)
         for artist in self._moving:
             self.ax.draw_artist(artist)
@@ -414,11 +451,9 @@ class App(tk.Tk):
     # ---------------------------------------------------------------- отчёт
 
     def _write_report(self) -> None:
-        s, st, tr = self.shot, self.shot.launch, self.shot.ideal
-        result = f"без сопротивления воздуха — {verdict(tr.distance, s.x1, s.x2)}"
-        if s.drag:
-            result += f";   с сопротивлением — {verdict(s.drag.distance, s.x1, s.x2)}"
-        lines = [f"ЗАДАНИЕ  x₁ = {s.x1:g} м, x₂ = {s.x2:g} м:   {result}", ""]
+        s, st, tr = self.shot, self.shot.launch, self.shot.trajectory
+        result = verdict(tr.distance, s.x1, s.x2)
+        lines = [f"Целевой диапазон {decimal(s.x1, 2)}–{decimal(s.x2, 2)} м · {result}", ""]
         if s.catapult:
             lines += [
                 "РАЗГОН СНАРЯДА (раздел 4) — баланс энергии",
@@ -434,50 +469,101 @@ class App(tk.Tk):
                 f"θ = 90° − α₁ = {st.angle:.1f}°,   h₀ = H + L·sin α₁ = {st.h0:.3f} м",
             ]
         else:
-            lines += ["ПАРАМЕТРЫ ОТРЫВА (заданы вручную)",
-                      f"  V₀ = {st.v0:.3f} м/с,   θ = {st.angle:.1f}°,   h₀ = {st.h0:.3f} м"]
+            lines += [f"Средняя дальность трёх пусков ≈ {decimal(EXPERIMENTAL_RANGE, 2)} м от точки вылета."]
 
         a, b, c = ph.parabola(st, self._value("g"))
         lines += [
             "",
-            "ПОЛЁТ БЕЗ СОПРОТИВЛЕНИЯ ВОЗДУХА (раздел 5)",
-            f"  траектория — парабола:  y(x) = {a:.3f} {'+' if b >= 0 else '−'} {abs(b):.3f}·x "
-            f"− {c:.3f}·x²",
-            f"  время полёта   t = (V₀·sinθ + √(V₀²·sin²θ + 2·g·h₀))/g = {tr.flight_time:.3f} с",
-            f"  дальность      x = V₀·cosθ·t = {tr.distance:.3f} м",
-            f"  наивысшая точка  y_max = {tr.max_height:.3f} м  при x = {tr.x_at_max:.3f} м",
-            f"  скорость в момент падения {tr.impact_speed:.2f} м/с под углом "
-            f"{tr.impact_angle:.1f}° к горизонту",
+            "Расчёт полёта",
+            f"Дальность {decimal(tr.distance, 3)} м  ·  время {decimal(tr.flight_time, 3)} с  ·  "
+            f"максимальная высота {decimal(tr.max_height, 3)} м",
+            f"y(x) = {decimal(a, 3)} {'+' if b >= 0 else '−'} {decimal(abs(b), 3)}x − {decimal(c, 3)}x²",
+            f"Скорость при падении {decimal(tr.impact_speed, 2)} м/с, угол к горизонту {decimal(tr.impact_angle, 1)}°.",
         ]
-        if s.drag:
-            d = s.drag
-            lines += [
-                "",
-                "ПОЛЁТ С СОПРОТИВЛЕНИЕМ ВОЗДУХА (F = ½·ρ·Cx·S·v², численный расчёт)",
-                f"  t = {d.flight_time:.3f} с,   x = {d.distance:.3f} м "
-                f"({(d.distance - tr.distance) / tr.distance:+.1%} к идеальному),   "
-                f"y_max = {d.max_height:.3f} м",
-            ]
 
         self.report.configure(state="normal")
         self.report.delete("1.0", "end")
         self.report.insert("1.0", "\n".join(lines))
+        self.report.tag_configure("summary", font=(FONT, 12, "bold"), foreground=TERRACOTTA)
+        self.report.tag_add("summary", "1.0", "1.end")
         self.report.configure(state="disabled")
+
+
+class PrototypeDialog(tk.Toplevel):
+    """Редактирование исходных данных разделов 3–5 для сборки команды."""
+
+    def __init__(self, app: App) -> None:
+        super().__init__(app)
+        self.app = app
+        self.title("Параметры разделов 3–5")
+        self.transient(app)
+        self.measurements = app.prototype_loads
+        self.vars: dict[str, tk.StringVar] = {}
+        self.labels: dict[str, str] = {}
+
+        content = ttk.Frame(self, padding=12)
+        content.pack(fill="both", expand=True)
+        for title, fields in (
+            ("3. Резинка", PROTOTYPE_SPRING),
+            ("4. Разгон", PROTOTYPE_ARM),
+            ("5. Полёт", MANUAL[1:] + GRAVITY),
+        ):
+            box = ttk.LabelFrame(content, text=title, padding=(8, 4))
+            box.pack(fill="x", pady=(0, 5))
+            box.columnconfigure(0, weight=1)
+            for row, (key, label, _) in enumerate(fields):
+                initial = app.prototype_values[key] if key in app.prototype_values else app.vars[key].get()
+                self.vars[key] = tk.StringVar(master=self, value=initial)
+                self.labels[key] = label
+                ttk.Label(box, text=label).grid(row=row, column=0, sticky="w", padx=(0, 12))
+                ttk.Entry(box, textvariable=self.vars[key], width=10, justify="right").grid(
+                    row=row, column=1, pady=1, sticky="e")
+            if fields is PROTOTYPE_SPRING:
+                ttk.Button(box, text="Рассчитать k по замерам…", command=lambda: StiffnessDialog(app, self)).grid(
+                    row=len(fields), column=0, columnspan=2, sticky="ew", pady=(4, 2))
+
+        ttk.Label(content, text="Скорость вылета рассчитывается по балансу энергии.").pack(anchor="w", pady=(2, 6))
+        ttk.Button(content, text="Применить и рассчитать", style="Run.TButton", command=self._apply).pack(fill="x")
+        self.bind("<Escape>", lambda _event: self.destroy())
+
+    def _apply(self) -> None:
+        app = self.app
+        try:
+            values = {key: parse_number(var.get(), self.labels[key]) for key, var in self.vars.items()}
+            prototype = ph.Prototype(**{key: values[key] for key in app.prototype_values})
+            speed = ph.prototype_speed(prototype, values["g"])
+            entered_speed = f"{speed:.3g}".replace(".", ",")
+            ph.manual_launch(parse_number(entered_speed, "Скорость вылета"), values["theta"], values["h0"])
+            app._target_range()
+        except ValueError as err:
+            messagebox.showerror("Ошибка в исходных данных", str(err), parent=self)
+            return
+
+        app.prototype_values = {key: self.vars[key].get() for key in app.prototype_values}
+        app.prototype_loads = self.measurements
+        app.vars["v0"].set(entered_speed)
+        for key in ("theta", "h0", "g"):
+            app.vars[key].set(self.vars[key].get())
+        app.mode.set("manual")
+        app._on_option()
+        self.destroy()
 
 
 class StiffnessDialog(tk.Toplevel):
     """Раздел 3: коэффициент жёсткости пружины по опыту с подвешенными грузами."""
 
-    def __init__(self, app: App) -> None:
-        super().__init__(app)
+    def __init__(self, app: App, prototype: PrototypeDialog | None = None) -> None:
+        parent = prototype if prototype is not None else app
+        super().__init__(parent)
         self.app = app
-        self.title("Жёсткость пружины (раздел 3)")
-        self.transient(app)
+        self.prototype = prototype
+        self.title("Жёсткость упругого элемента (раздел 3)")
+        self.transient(parent)
 
         frame = ttk.Frame(self, padding=10)
         frame.pack(fill="both", expand=True)
-        ttk.Label(frame, text="Длина пружины без груза l₀, м").grid(row=0, column=0, sticky="w")
-        self.l0 = tk.StringVar()
+        ttk.Label(frame, text="Длина без груза l₀, м").grid(row=0, column=0, sticky="w")
+        self.l0 = tk.StringVar(master=self, value=prototype.vars["l0"].get() if prototype else "")
         ttk.Entry(frame, textvariable=self.l0, width=12, justify="right").grid(
             row=0, column=1, sticky="w", padx=6, pady=(0, 6))
 
@@ -486,8 +572,12 @@ class StiffnessDialog(tk.Toplevel):
         for col, text in enumerate(("№", "Масса груза m, кг", "Длина пружины l, м")):
             ttk.Label(self.table, text=text).grid(row=0, column=col, padx=4)
         self.rows: list[tuple[tk.StringVar, tk.StringVar]] = []
-        for _ in range(5):
+        loads = prototype.measurements if prototype else ()
+        for _ in range(max(5, len(loads))):
             self._add_row()
+        for (mass, length), (m, l) in zip(self.rows, loads):
+            mass.set(m)
+            length.set(l)
 
         buttons = ttk.Frame(frame)
         buttons.grid(row=2, column=0, columnspan=2, sticky="w", pady=(6, 0))
@@ -516,10 +606,15 @@ class StiffnessDialog(tk.Toplevel):
                     continue  # пустые строки таблицы пропускаем
                 masses.append(parse_number(m.get(), f"Масса груза №{i}"))
                 lengths.append(parse_number(l.get(), f"Длина пружины №{i}"))
-            try:
-                g = self.app._value("g")
-            except ValueError:
-                g = ph.G
+            if self.prototype:
+                g = parse_number(self.prototype.vars["g"].get(), self.prototype.labels["g"])
+            else:
+                try:
+                    g = self.app._value("g")
+                except ValueError:
+                    g = ph.G
+            if g <= 0:
+                raise ValueError("Ускорение свободного падения g должно быть положительным.")
             res = ph.spring_stiffness(l0, masses, lengths, g)
         except ValueError as err:
             messagebox.showerror("Ошибка", str(err), parent=self)
@@ -540,7 +635,14 @@ class StiffnessDialog(tk.Toplevel):
 
     def _apply(self) -> None:
         res = self._compute()
-        if res:
+        if not res:
+            return
+        if self.prototype:
+            self.prototype.vars["k"].set(f"{res.k_mean:.3g}".replace(".", ","))
+            self.prototype.vars["l0"].set(self.l0.get())
+            self.prototype.measurements = tuple((m.get(), l.get()) for m, l in self.rows if m.get() or l.get())
+            self.destroy()
+        else:
             self.app.vars["k"].set(f"{res.k_mean:.4g}")
             self.destroy()
             self.app.calculate()
